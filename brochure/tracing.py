@@ -453,7 +453,7 @@ class _CloudTrace:
         self.client = self.tree = self.scope = self.context = None
         self.failed = False
         self.lock = threading.Lock()
-        config = _langsmith_config(store.workspace)
+        config = self.config = _langsmith_config(store.workspace)
         self.status = langsmith_status(store.workspace)['status']
         try:
             from langsmith import trace, tracing_context
@@ -509,7 +509,8 @@ class _CloudTrace:
         url = None
         try:
             if self.tree is not None:
-                from langsmith.utils import LangSmithNotFoundError
+                from langsmith import NotFoundError
+                from .langsmith_reads import create_reader, resolve_project_id
                 self.tree.end(outputs={'usage': usage}, error=error)
                 self.tree.patch()
                 # Non-batched post/patch report errors, but only a server read
@@ -517,22 +518,33 @@ class _CloudTrace:
                 # Newly ingested runs can briefly be invisible. Retry only this
                 # read on NotFound, with at most 2.5 seconds of waiting; writes
                 # and model requests are never repeated here.
-                saved = None
-                for delay in (0, 0.25, 0.75, 1.5):
-                    if delay:
-                        time.sleep(delay)
-                    try:
-                        saved = self.client.read_run(self.tree.id)
-                        break
-                    except LangSmithNotFoundError:
-                        continue
-                if saved is not None and str(saved.id) == str(self.tree.id):
-                    candidate = self.client.get_run_url(run=saved)
-                    if isinstance(candidate, str) and candidate.startswith('https://'):
-                        url = candidate
-                    self.status = 'failed' if self.failed else 'sent'
-                else:
-                    self.status = 'failed' if self.failed else 'unverified'
+                with create_reader(self.config) as reader:
+                    project_id = resolve_project_id(self.config, reader, self.client)
+                    saved = None
+                    for delay in (0, 0.25, 0.75, 1.5):
+                        if delay:
+                            time.sleep(delay)
+                        try:
+                            saved = reader.runs.retrieve_v2(
+                                str(self.tree.id), project_id=project_id,
+                                selects=['ID', 'PROJECT_ID', 'TRACE_ID', 'START_TIME'],
+                                start_time=self.tree.start_time)
+                            break
+                        except NotFoundError:
+                            continue
+                    if (saved is not None and str(saved.id) == str(self.tree.id)
+                            and str(saved.project_id) == project_id
+                            and str(saved.trace_id) == str(self.tree.trace_id)):
+                        start_time = saved.start_time or self.tree.start_time
+                        candidate = reader.runs.get_url(
+                            str(saved.id), project_id=str(saved.project_id),
+                            trace_id=str(saved.trace_id),
+                            start_time=start_time.isoformat()).url
+                        if isinstance(candidate, str) and candidate.startswith('https://'):
+                            url = candidate
+                        self.status = 'failed' if self.failed else 'sent'
+                    else:
+                        self.status = 'failed' if self.failed else 'unverified'
         except Exception:
             self.status = 'failed'
         finally:

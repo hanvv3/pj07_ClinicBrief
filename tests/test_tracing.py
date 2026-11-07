@@ -7,12 +7,19 @@ import tempfile
 import threading
 import unittest
 import sqlite3
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
+
+# Match the SDK's transport dependency: current releases prefer httpx2 while
+# older supported environments can still provide httpx.
+try:
+    import httpx2 as httpx
+except ImportError:
+    import httpx
 
 from brochure.provider import OpenAIProvider, ProviderError
 from brochure import tracing
@@ -26,6 +33,46 @@ def response(text='공개 조사 결과'):
                 {'type': 'message', 'status': 'completed', 'role': 'assistant',
                  'content': [{'type': 'output_text', 'text': text, 'annotations': []}]}],
             'usage': {'input_tokens': 40, 'output_tokens': 20, 'total_tokens': 60}}
+
+
+PROJECT_ID = '1f06389f-1301-49bf-ae51-36b9ef83e715'
+CLOUD_URL = 'https://smith.langchain.com/o/test/r/confirmed'
+
+
+@contextmanager
+def cloud_read_transport(handler=None):
+    """Exercise the real sync SDK's wire contract without any external traffic."""
+    from langsmith import Langsmith
+    requests, readers = [], []
+
+    def transport(request):
+        requests.append(request)
+        if request.method != 'GET':
+            raise AssertionError('Cloud verification must only read')
+        if handler is not None:
+            result = handler(request)
+            if result is not None:
+                return result
+        path = request.url.path
+        if path == '/api/v1/sessions/resolutions':
+            return httpx.Response(200, json={'session_id': PROJECT_ID})
+        if not path.startswith('/api/v2/runs/'):
+            raise AssertionError('Unexpected endpoint: ' + path)
+        if path.endswith('/url'):
+            return httpx.Response(200, json={'url': CLOUD_URL})
+        identifier = path.rsplit('/', 1)[-1]
+        return httpx.Response(200, json={'id': identifier, 'project_id': PROJECT_ID,
+                              'trace_id': identifier, 'start_time': request.url.params['start_time']})
+
+    def make_reader(**kwargs):
+        reader = Langsmith(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(transport)))
+        readers.append(reader)
+        return reader
+
+    with patch('langsmith.Langsmith', side_effect=make_reader), \
+         patch('langsmith.client.Client.read_project', return_value=SimpleNamespace(id=PROJECT_ID)) as project, \
+         patch('langsmith.client.Client.request_with_retries', side_effect=AssertionError('Unexpected legacy transport')):
+        yield requests, readers, project
 
 
 class TracingTests(unittest.TestCase):
@@ -448,8 +495,7 @@ class TracingTests(unittest.TestCase):
                                 'LANGSMITH_API_KEY': 'lsv2_test_private_credential_0000'}))
             stack.enter_context(patch('langsmith.client.Client.create_run', create))
             stack.enter_context(patch('langsmith.client.Client.update_run', update))
-            stack.enter_context(patch('langsmith.client.Client.read_run', lambda self, run_id: SimpleNamespace(id=run_id)))
-            stack.enter_context(patch('langsmith.client.Client.get_run_url', return_value='https://smith.langchain.com/o/test/r/confirmed'))
+            requests, readers, project = stack.enter_context(cloud_read_transport())
             stack.enter_context(self.transport(response()))
             with tracing.research_trace(self.store, 'cloud-ok', 'alice', 'research'):
                 self.request('sk-test-leaked-secret-000000')
@@ -465,6 +511,15 @@ class TracingTests(unittest.TestCase):
         self.assertNotIn('NEVER_STORE_REASONING', export)
         self.assertNotIn('sk-test-leaked-secret', export)
         self.assertNotIn('lsv2_test_private', export)
+        project.assert_called_once_with(project_name='clinic-brief-research')
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].url.params.get_list('selects'),
+                         ['ID', 'PROJECT_ID', 'TRACE_ID', 'START_TIME'])
+        self.assertEqual(requests[0].url.params['project_id'], PROJECT_ID)
+        self.assertEqual(requests[1].url.params['trace_id'], str(created[0]['id']))
+        self.assertEqual(readers[0].max_retries, 0)
+        self.assertEqual(readers[0].timeout, 2.0)
+        self.assertTrue(readers[0].is_closed())
 
     def test_langsmith_agent_address_exports_manual_graph_calls_only(self):
         from tests.test_insights import InsightHTTPFixtures, scouts, selected
@@ -478,8 +533,7 @@ class TracingTests(unittest.TestCase):
                                 'LANGSMITH_AGENT_ID': 'clinic-research', 'LANGSMITH_AGENT_ENVIRONMENT': 'local'}))
             stack.enter_context(patch('langsmith.client.Client.create_run', create))
             stack.enter_context(patch('langsmith.client.Client.update_run', return_value=None))
-            stack.enter_context(patch('langsmith.client.Client.read_run', lambda self, run_id: SimpleNamespace(id=run_id)))
-            stack.enter_context(patch('langsmith.client.Client.get_run_url', return_value='https://smith.langchain.com/o/test/r/confirmed'))
+            requests, readers, project = stack.enter_context(cloud_read_transport())
             stack.enter_context(patch('brochure.provider.urlopen', fixture))
             with tracing.research_trace(self.store, 'cloud-agent', 'alice', 'research'):
                 self.provider.discover_insights('operations')
@@ -490,22 +544,33 @@ class TracingTests(unittest.TestCase):
         for child in created[1:]:
             self.assertEqual(child['parent_run_id'], created[0]['id'])
             self.assertEqual(child['address'], created[0]['address'])
+        project.assert_not_called()
+        self.assertEqual(requests[0].url.path, '/api/v1/sessions/resolutions')
+        self.assertEqual(dict(requests[0].url.params),
+                         {'kind': 'AGENT', 'id': 'clinic-research', 'environment': 'LOCAL'})
+        self.assertEqual(requests[1].url.params['project_id'], PROJECT_ID)
+        self.assertTrue(readers[0].is_closed())
 
     def test_langsmith_visibility_polling_retries_only_not_found_and_is_bounded(self):
-        from langsmith.utils import LangSmithAuthError, LangSmithConnectionError, LangSmithNotFoundError
         cases = [
-            ('delayed', LangSmithNotFoundError, 2, 'sent', 3, [0.25, 0.75]),
-            ('absent', LangSmithNotFoundError, 10, 'unverified', 4, [0.25, 0.75, 1.5]),
-            ('auth', LangSmithAuthError, 10, 'failed', 1, []),
-            ('network', LangSmithConnectionError, 10, 'failed', 1, []),
+            ('delayed', 404, 2, 'sent', 3, [0.25, 0.75]),
+            ('absent', 404, 10, 'unverified', 4, [0.25, 0.75, 1.5]),
+            ('auth', 401, 10, 'failed', 1, []),
+            ('network', None, 10, 'failed', 1, []),
+            ('rate-limit', 429, 10, 'failed', 1, []),
+            ('server', 503, 10, 'failed', 1, []),
         ]
-        for name, error_type, failures, expected_status, expected_reads, expected_waits in cases:
+        for name, http_status, failures, expected_status, expected_reads, expected_waits in cases:
             reads, waits, writes = [], [], []
-            def read(client, run_id):
-                reads.append(run_id)
+            def read(request):
+                if request.url.path.endswith('/url'):
+                    return None
+                reads.append(request)
                 if len(reads) <= failures:
-                    raise error_type('PRIVATE_CLOUD_RESPONSE')
-                return SimpleNamespace(id=run_id)
+                    if http_status is None:
+                        raise httpx.ConnectError('PRIVATE_CLOUD_RESPONSE', request=request)
+                    return httpx.Response(http_status, json={'detail': 'PRIVATE_CLOUD_RESPONSE'})
+                return None
             def create(client, **kwargs):
                 writes.append(('create', kwargs['id']))
             def update(client, **kwargs):
@@ -515,8 +580,7 @@ class TracingTests(unittest.TestCase):
                                     'LANGSMITH_API_KEY': 'lsv2_test_private_credential_0000'}))
                 stack.enter_context(patch('langsmith.client.Client.create_run', create))
                 stack.enter_context(patch('langsmith.client.Client.update_run', update))
-                stack.enter_context(patch('langsmith.client.Client.read_run', read))
-                stack.enter_context(patch('langsmith.client.Client.get_run_url', return_value='https://smith.langchain.com/o/test/r/confirmed'))
+                requests, readers, project = stack.enter_context(cloud_read_transport(read))
                 stack.enter_context(patch('brochure.tracing.time.sleep', side_effect=waits.append))
                 stack.enter_context(self.transport(response()))
                 with tracing.research_trace(self.store, 'visibility-' + name, 'alice', 'research'):
@@ -530,6 +594,65 @@ class TracingTests(unittest.TestCase):
                 self.assertEqual(stored['usage']['requests'], 1)
                 self.assertEqual(bool(stored['langsmith_url']), expected_status == 'sent')
                 self.assertNotIn('PRIVATE_CLOUD_RESPONSE', json.dumps(stored))
+                self.assertTrue(readers[0].is_closed())
+
+    def test_langsmith_incomplete_or_mismatched_identity_never_exposes_link(self):
+        for fields in ({}, {'project_id': PROJECT_ID},
+                       {'project_id': 'wrong-project', 'trace_id': 'wrong-trace'}):
+            def read(request):
+                if not request.url.path.endswith('/url'):
+                    return httpx.Response(200, json={'id': request.url.path.rsplit('/', 1)[-1], **fields})
+                return None
+            with self.subTest(fields=fields), ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {'LANGSMITH_TRACING': 'true',
+                                    'LANGSMITH_API_KEY': 'lsv2_test_private_credential_0000'}))
+                stack.enter_context(patch('langsmith.client.Client.create_run'))
+                stack.enter_context(patch('langsmith.client.Client.update_run'))
+                requests, readers, project = stack.enter_context(cloud_read_transport(read))
+                stack.enter_context(self.transport(response()))
+                with tracing.research_trace(self.store, 'incomplete', 'alice', 'research'):
+                    self.request()
+                stored = self.store.get('alice', 'incomplete')
+                self.assertEqual(stored['status'], 'completed')
+                self.assertEqual(stored['langsmith_status'], 'unverified')
+                self.assertIsNone(stored['langsmith_url'])
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(readers[0].is_closed())
+
+    def test_langsmith_read_verification_uses_configured_region(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {'LANGSMITH_TRACING': 'true',
+                                'LANGSMITH_API_KEY': 'lsv2_test_private_credential_0000',
+                                'LANGSMITH_ENDPOINT': 'https://eu.api.smith.langchain.com'}))
+            stack.enter_context(patch('langsmith.client.Client.create_run'))
+            stack.enter_context(patch('langsmith.client.Client.update_run'))
+            requests, readers, project = stack.enter_context(cloud_read_transport())
+            stack.enter_context(self.transport(response()))
+            with tracing.research_trace(self.store, 'region', 'alice', 'research'):
+                self.request()
+        self.assertEqual(self.store.get('alice', 'region')['langsmith_status'], 'sent')
+        self.assertEqual({request.url.host for request in requests}, {'eu.api.smith.langchain.com'})
+
+    def test_langsmith_unsupported_agent_resolution_preserves_local_result(self):
+        def read(request):
+            return httpx.Response(501, json={'detail': 'PRIVATE_CLOUD_RESPONSE'})
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {'LANGSMITH_TRACING': 'true',
+                                'LANGSMITH_API_KEY': 'lsv2_test_private_credential_0000',
+                                'LANGSMITH_AGENT_ID': 'clinic-research', 'LANGSMITH_AGENT_ENVIRONMENT': 'local'}))
+            stack.enter_context(patch('langsmith.client.Client.create_run'))
+            stack.enter_context(patch('langsmith.client.Client.update_run'))
+            requests, readers, project = stack.enter_context(cloud_read_transport(read))
+            stack.enter_context(self.transport(response()))
+            with tracing.research_trace(self.store, 'unsupported-agent', 'alice', 'research'):
+                self.request()
+        result = self.store.get('alice', 'unsupported-agent')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['langsmith_status'], 'failed')
+        self.assertIsNone(result['langsmith_url'])
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(readers[0].is_closed())
+        project.assert_not_called()
 
 
 if __name__ == '__main__':
