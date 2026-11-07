@@ -1,0 +1,57 @@
+# Python environments, caches, and build output
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local credentials and environment settings (keep the empty template)
+.env
+.env.*
+!.env.example
+.aws/
+.ssh/
+*.pem
+*.key
+
+# Local app data, including accounts, sessions, jobs, and exports
+.local-data/
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*-journal
+output/
+tmp/
+*.log
+
+# Local source documents and machine-specific agent settings
+original-specs*
+.codex/
+
+# Generated verification evidence; keep Markdown reports and test protocols
+/docs/verification/*.png
+/docs/verification/*.jpg
+/docs/verification/*.jpeg
+/docs/verification/*.json
+/docs/experiments/**/*.json
+/docs/experiments/**/*.png
+/docs/experiments/**/*.jpg
+/docs/experiments/**/*.jpeg
+/docs/experiments/**/*.pdf
+/docs/experiments/**/*.docx
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
