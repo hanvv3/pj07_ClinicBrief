@@ -131,8 +131,8 @@ node tests/test_ui.cjs
 Codex 환경에서는 위 Python 대신 번들 경로를 사용합니다.
 
 ```bash
-/home/seanhan/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m unittest discover -s tests -v
-/home/seanhan/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 scripts/verify_samples.py
+/home/$USER/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m unittest discover -s tests -v
+/home/$USER/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 scripts/verify_samples.py
 ```
 
 샘플 파일은 `output/` 아래 생성합니다. 실제 DOCX·PDF 렌더링 검증에는 LibreOffice와 한국어 글꼴이 필요합니다. 테스트는 계정 간 접근 차단, 세션·CSRF, 중복 유료 작업 방지, 사용 한도, 재시작 중단, 저장·삭제·버전 충돌, 부분 출력 복구, 출처 연결과 비공개 설명 분리를 확인합니다. UI 상태 회귀 테스트에는 Node.js 18 이상이 필요하며 앱 실행 자체에는 Node.js가 필요하지 않습니다.

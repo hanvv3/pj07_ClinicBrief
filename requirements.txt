@@ -1,6 +1,5 @@
 python-docx==1.2.0
 pypdf==6.10.0
-uv
 langgraph==1.2.20
 langsmith==0.14.17
 mcp==1.30.0
