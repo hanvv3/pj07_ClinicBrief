@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Improvement Lab"
+  short_description: "Compare skills with fixed rubrics and real feedback"
+  default_prompt: "Use $skill-improvement-lab to compare these workflow versions and improve the observed failure."

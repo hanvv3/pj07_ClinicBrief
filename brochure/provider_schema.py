@@ -30,7 +30,7 @@ COVERAGE_AREAS = ('medical', 'ai', 'operations', 'economy', 'life')
 BROCHURE = obj(
     title=string(100), intro=string(700),
     sections=array(obj(heading=string(120), body=string(1500), source_ids=SOURCE_IDS), 5),
-    example=obj(heading=string(120), body=string(1600)), limitations=array(string(600), 6),
+    example=obj(heading=string(120, 0), body=string(1600, 0)), limitations=array(string(600), 6, 0),
     sender=obj(name={'type': 'string', 'enum': ['']}, contact={'type': 'string', 'enum': ['']}),
 )
 NOTES = obj(opening_staff=string(600), opening_director=string(600), explanation=string(2000),

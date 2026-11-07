@@ -1,0 +1,4 @@
+interface:
+  display_name: "GEPA Optimization"
+  short_description: "Optimize prompts with bounded, feedback-driven trials"
+  default_prompt: "Use $gepa-optimize-anything to design and run a bounded optimization experiment using our evaluation criteria."

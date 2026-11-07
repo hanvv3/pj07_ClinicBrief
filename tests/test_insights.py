@@ -1,18 +1,54 @@
 """Offline Responses fixtures exercise the real bounded insight orchestrator."""
 import copy
+import io
 import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 from unittest.mock import patch
 
 from brochure.provider import OpenAIProvider, ProviderError, _public_topic
-from tests.test_provider import HTTPFixtures, response
+from tests.test_provider import response
 
 CLINIC = 'https://clinic.example.org/notices/printing'
 TOOLS = 'https://maker.example.org/help/print-status'
 ANSWER = 'https://maker.example.org/help/print-queue'
+STAGES = ('insight_clinic_scout', 'insight_tools_scout', 'insight_selection',
+          'insight_answer_research', 'insight_topics', 'insight_edit', 'insight_audit')
+
+
+def request_stage(request):
+    payload = json.loads(request.data)
+    name = payload['text']['format'].get('name')
+    if name:
+        return name
+    instructions = payload['instructions']
+    if 'Independently scout public clinic/hospital' in instructions:
+        return 'insight_clinic_scout'
+    if 'Independently scout complementary' in instructions:
+        return 'insight_tools_scout'
+    return 'insight_answer_research'
+
+
+class InsightHTTPFixtures:
+    """Route offline responses by stage, never by racing worker arrival order."""
+
+    def __init__(self, *outputs):
+        self.outputs = dict(zip(STAGES, outputs))
+        self.requests = []
+        self.lock = threading.Lock()
+
+    def __call__(self, request, timeout):
+        with self.lock:
+            self.requests.append((request, timeout))
+            result = self.outputs.pop(request_stage(request))
+        if isinstance(result, Exception):
+            raise result
+        return io.BytesIO(json.dumps(result, ensure_ascii=False).encode())
 
 
 def narrative(url, text, *, opened=True, cited=True):
@@ -76,6 +112,13 @@ def audit(*ids, passed=True, reason=''):
                                    'provenance_correct': passed, 'reason': reason} for identifier in ids]})
 
 
+def edited_topic(topic):
+    item = {key: copy.deepcopy(topic[key]) for key in
+            ('id', 'title', 'summary', 'director_value', 'takeaway', 'why_now')}
+    item['ready_to_use'] = {key: topic['ready_to_use'][key] for key in ('title', 'body')}
+    return item
+
+
 class InsightTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -89,23 +132,138 @@ class InsightTests(unittest.TestCase):
         self.addCleanup(clock.stop)
 
     def transport(self, *outputs):
-        fixture = HTTPFixtures(*outputs)
+        fixture = InsightHTTPFixtures(*outputs)
         patched = patch('brochure.provider.urlopen', fixture)
         patched.start()
         self.addCleanup(patched.stop)
         return fixture
 
-    def full(self, *, candidates=None, topics=None, audited=None):
+    def full(self, *, candidates=None, topics=None, edited=None, audited=None):
+        topics = topics if topics is not None else [final_topic()]
         return self.transport(*scouts(), selected(*(candidates if candidates is not None else [candidate()])),
                               narrative(ANSWER, '공식 제품 도움말은 출력 대기열에서 문서 상태를 볼 수 있다고 설명합니다. 날짜 미상.'),
-                              response({'topics': topics if topics is not None else [final_topic()]}),
+                              response({'topics': topics}),
+                              edited if edited is not None else response({'topics': [edited_topic(t) for t in topics]}),
                               audited if audited is not None else audit('P1'))
 
     @staticmethod
     def payloads(transport):
-        return [json.loads(request.data) for request, _ in transport.requests]
+        ordered = sorted(transport.requests, key=lambda item: STAGES.index(request_stage(item[0])))
+        return [json.loads(request.data) for request, _ in ordered]
 
-    def test_six_bounded_stages_publish_complete_asset_with_exact_provenance(self):
+    def test_scouts_overlap_join_before_selection_and_keep_lane_source_ids(self):
+        clinic_url = 'https://z-clinic.example.org/notice'
+        tools_url = 'https://a-maker.example.org/help'
+        trace_context = ContextVar('insight_test_trace', default=None)
+        for first in STAGES[:2]:
+            with self.subTest(first=first):
+                barrier = threading.Barrier(2, timeout=2)
+                first_finished = threading.Event()
+                completed, contexts = [], []
+                lock = threading.Lock()
+                fixture = InsightHTTPFixtures(narrative(clinic_url, '의원 원문 보고서'),
+                                             narrative(tools_url, '제조사 원문 보고서'), selected())
+
+                def request(request, timeout):
+                    name = request_stage(request)
+                    if name in STAGES[:2]:
+                        contexts.append(trace_context.get())
+                        try:
+                            barrier.wait()
+                        except threading.BrokenBarrierError:
+                            self.fail('The second independent scout never ran concurrently.')
+                        if name != first:
+                            self.assertTrue(first_finished.wait(2))
+                        with lock:
+                            completed.append(name)
+                        if name == first:
+                            first_finished.set()
+                    else:
+                        self.assertEqual(set(completed), set(STAGES[:2]))
+                    return fixture(request, timeout)
+
+                token = trace_context.set('public-run-context')
+                try:
+                    with patch('brochure.provider.urlopen', request):
+                        result = self.provider.discover_insights('operations')
+                finally:
+                    trace_context.reset(token)
+                self.assertEqual(result['topics'], [])
+                self.assertEqual(result['usage']['requests'], 3)
+                self.assertEqual(completed[0], first)
+                self.assertEqual(contexts, ['public-run-context', 'public-run-context'])
+                selection = json.loads(self.payloads(fixture)[2]['input'][0]['content'])
+                self.assertEqual(selection['verified_sources'], {'S1': clinic_url, 'S2': tools_url})
+                self.assertEqual([report['lane'] for report in selection['scout_reports']], list(STAGES[:2]))
+                self.assertEqual([report['report'] for report in selection['scout_reports']],
+                                 ['의원 원문 보고서', '제조사 원문 보고서'])
+
+    def test_concurrent_runs_on_same_provider_do_not_mix_reports_or_contexts(self):
+        barrier = threading.Barrier(4, timeout=3)
+        trace_context = ContextVar('concurrent_insight_test_trace', default=None)
+        selected_inputs = {}
+        lock = threading.Lock()
+
+        def request(request, timeout):
+            name = request_stage(request)
+            data = json.loads(json.loads(request.data)['input'][0]['content'])
+            category = data['category']
+            self.assertEqual(trace_context.get(), category)
+            if name in STAGES[:2]:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    self.fail('Independent runs must both execute both scouts concurrently.')
+                raw = narrative(f'https://public.example.org/{category}/{name}', category + ' 공개 보고서')
+            else:
+                self.assertEqual(name, 'insight_selection')
+                with lock:
+                    selected_inputs[category] = data
+                raw = selected()
+            return io.BytesIO(json.dumps(raw, ensure_ascii=False).encode())
+
+        def run(category):
+            token = trace_context.set(category)
+            try:
+                return self.provider.discover_insights(category)
+            finally:
+                trace_context.reset(token)
+
+        with patch('brochure.provider.urlopen', request), ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(run, category) for category in ('operations', 'communication')]
+            results = [future.result() for future in futures]
+        for category, data in selected_inputs.items():
+            self.assertEqual([report['report'] for report in data['scout_reports']],
+                             [category + ' 공개 보고서'] * 2)
+            self.assertTrue(all('/' + category + '/' in url for url in data['verified_sources'].values()))
+        self.assertEqual(len(selected_inputs), 2)
+        self.assertEqual([result['usage']['requests'] for result in results], [3, 3])
+
+    def test_graph_states_serialize_without_credentials_or_raw_reasoning(self):
+        from brochure.insights import _build_graph
+
+        fixture = self.full()
+        for raw in fixture.outputs.values():
+            raw['private_transport_metadata'] = 'PRIVATE_TRANSPORT_MARKER'
+            raw['output'].insert(0, {'type': 'reasoning', 'summary': ['PRIVATE_REASONING_MARKER']})
+        initial = {
+            'public_input': {'category': 'operations', 'validation_context': {'research_date': '2026-11-03'}},
+            'history': {'recent_topics': [], 'feedback': []},
+            'responses': [], 'reports': [], 'verified': {}, 'rejected': {},
+            'considered': 0, 'chosen': [], 'answer_ids': [], 'published': [],
+        }
+        messages = []
+        graph = _build_graph(self.provider, messages.append)
+        for state in graph.stream(initial, config={'max_concurrency': 2}, stream_mode='values'):
+            serialized = json.dumps(state, ensure_ascii=False)
+            self.assertNotIn('PRIVATE_TRANSPORT_MARKER', serialized)
+            self.assertNotIn('PRIVATE_REASONING_MARKER', serialized)
+            self.assertNotIn('sk-test-provider-credential', serialized)
+        self.assertEqual(len(state['result']['topics']), 1)
+        self.assertEqual(state['result']['usage']['requests'], 7)
+        self.assertTrue(messages)
+
+    def test_seven_bounded_stages_publish_complete_asset_with_exact_provenance(self):
         transport = self.full()
         result = self.provider.discover_insights('briefing')
         self.assertEqual(len(result['topics']), 1)
@@ -117,17 +275,17 @@ class InsightTests(unittest.TestCase):
         self.assertEqual(topic['sources'][1]['verification'], 'body_access_and_cited')
         self.assertEqual(result['selection_report'], {'sources_read': 3, 'candidates_considered': 1,
                                                      'rejected': [], 'selected_count': 1})
-        self.assertEqual(result['usage']['requests'], 6)
-        self.assertEqual(result['usage']['total_tokens'], 360)
+        self.assertEqual(result['usage']['requests'], 7)
+        self.assertEqual(result['usage']['total_tokens'], 420)
         requests = self.payloads(transport)
-        self.assertEqual([p.get('max_tool_calls', 0) for p in requests], [8, 8, 0, 8, 0, 0])
+        self.assertEqual([p.get('max_tool_calls', 0) for p in requests], [8, 8, 0, 8, 0, 0, 0])
         self.assertTrue(all(p['store'] is False for p in requests))
         inputs = [json.loads(p['input'][0]['content']) for p in requests]
         self.assertNotIn('scout_reports', inputs[1])
         self.assertEqual(inputs[0]['validation_context']['research_date'], '2026-11-03')
         self.assertEqual(inputs[0]['validation_context']['news_window']['start'], '2026-10-21')
         self.assertEqual(inputs[4]['verified_sources']['A1'], ANSWER)
-        self.assertEqual(inputs[5]['history'], {'recent_topics': [], 'feedback': []})
+        self.assertEqual(inputs[6]['history'], {'recent_topics': [], 'feedback': []})
         self.assertEqual(_public_topic(topic)['ready_to_use'], topic['ready_to_use'])
         self.assertEqual(_public_topic(topic)['selection'], topic['selection'])
 
@@ -141,6 +299,139 @@ class InsightTests(unittest.TestCase):
         self.assertEqual(len(transport.requests), 3)
         self.assertEqual(result['selection_report']['candidates_considered'], 1)
         self.assertIn('완성', result['selection_report']['rejected'][0]['reason'])
+
+    def test_news_brief_can_be_complete_without_a_task_or_adaptation(self):
+        story = candidate()
+        story.update(title='출력 대기열에서 문서 상태를 볼 수 있습니다', asset_format='brief')
+        story['selection']['problem'] = '출력 대기열은 직원에게 어떤 정보를 보여줄까'
+        story['selection']['reason'] = '장비를 관리하는 직원이 출력 대기열에서 볼 수 있는 정보를 이해할 수 있습니다.'
+        topic = final_topic()
+        topic['title'] = story['title']
+        topic['ready_to_use'] = {
+            'title': story['title'], 'format': 'brief', 'adaptation_note': '',
+            'body': '제조사 도움말에 따르면 출력 대기열에서 문서의 상태를 볼 수 있습니다. '
+                    '정확한 화면은 제품에 따라 다를 수 있습니다. 의원의 공개 안내에서도 '
+                    '직원이 출력 상태를 확인하는 업무를 소개하고 있습니다.'}
+        transport = self.full(candidates=[story], topics=[topic])
+        result = self.provider.discover_insights('briefing')
+        self.assertEqual(result['topics'][0]['ready_to_use'], topic['ready_to_use'])
+        self.assertEqual(result['topics'][0]['claims'], topic['claims'])
+        self.assertEqual(len(transport.requests), 7)
+
+    def test_editorial_guidance_is_loaded_for_topic_writing_and_audit(self):
+        prompts = Path(self.tmp.name) / 'prompts'
+        prompts.mkdir()
+        (prompts / 'editorial.md').write_text('SHARED_EDITORIAL_POLICY', encoding='utf-8')
+        (prompts / 'editorial-examples.md').write_text('FICTIONAL_STYLE_EXAMPLES', encoding='utf-8')
+        transport = self.full()
+        with patch('brochure.editorial.PROMPT_DIR', prompts):
+            self.provider.discover_insights('briefing')
+        requests = self.payloads(transport)
+        self.assertIn('SHARED_EDITORIAL_POLICY', requests[4]['instructions'])
+        self.assertIn('FICTIONAL_STYLE_EXAMPLES', requests[4]['instructions'])
+        self.assertIn('SHARED_EDITORIAL_POLICY', requests[5]['instructions'])
+        self.assertIn('FICTIONAL_STYLE_EXAMPLES', requests[5]['instructions'])
+        self.assertIn('SHARED_EDITORIAL_POLICY', requests[6]['instructions'])
+
+    def test_edit_replaces_public_copy_and_keeps_evidence_and_selection_intact(self):
+        topic = final_topic()
+        topic['summary'] = '출력 상태 확인 요청 전달의 필요성이 확인된 상황입니다.'
+        revised = edited_topic(topic)
+        revised['title'] = '프린터가 멈췄다면, 기사에게 이 문장을 보내세요'
+        revised['summary'] = '기사에게 출력 상태를 확인해 달라고 요청할 때 쓸 연락 문장입니다.'
+        revised['ready_to_use']['body'] = (
+            '안녕하세요. 프린터에서 문서가 나오지 않아 연락드립니다. 오류 문구와 출력 대기열을 확인한 뒤 '
+            '현재 상태를 알려드리겠습니다. 원격 확인이 가능한지 안내해 주세요. 방문이나 수리 비용이 '
+            '든다면 작업 전에 금액과 범위를 알려 주세요.')
+        transport = self.full(topics=[topic], edited=response({'topics': [revised]}))
+        result = self.provider.discover_insights('operations')
+        published = result['topics'][0]
+        self.assertEqual(published['title'], revised['title'])
+        self.assertEqual(published['summary'], revised['summary'])
+        self.assertEqual(published['ready_to_use']['body'], revised['ready_to_use']['body'])
+        self.assertEqual(published['claims'], topic['claims'])
+        for actual, original in zip(published['sources'], topic['sources']):
+            self.assertEqual({key: actual[key] for key in original}, original)
+        self.assertEqual(published['selection'], {**candidate()['selection'], 'total': 11})
+        for key in ('format', 'adaptation_note'):
+            self.assertEqual(published['ready_to_use'][key], topic['ready_to_use'][key])
+        self.assertEqual(published['evidence_status'], 'needs_review')
+        inputs = [json.loads(p['input'][0]['content']) for p in self.payloads(transport)]
+        edit_input = inputs[5]
+        self.assertEqual(set(edit_input), {'topics'})
+        item = edit_input['topics'][0]
+        self.assertEqual(set(item), {'id', 'audience', 'purpose', 'facts', 'draft'})
+        self.assertEqual(item['facts']['claims'], topic['claims'])
+        self.assertEqual(item['draft']['ready_to_use'], topic['ready_to_use'])
+        self.assertEqual(inputs[6]['proposed_topics'][0]['ready_to_use']['body'], revised['ready_to_use']['body'])
+        self.assertNotIn('scout_reports', json.dumps(edit_input))
+        self.assertNotIn('selection', json.dumps(edit_input))
+
+    def test_edit_requires_every_topic_once_and_no_unknown_id(self):
+        second = candidate('P2')
+        second['selection']['problem_key'] = 'different-task'
+        for ids in ([], ['P1'], ['P1', 'P1'], ['P1', 'OTHER']):
+            with self.subTest(ids=ids):
+                items = [edited_topic(final_topic(identifier)) for identifier in ids]
+                transport = self.full(candidates=[candidate(), second],
+                                      topics=[final_topic(), final_topic('P2')],
+                                      edited=response({'topics': items}))
+                with self.assertRaises(ProviderError):
+                    self.provider.discover_insights('operations')
+                self.assertEqual(len(transport.requests), 6)
+
+    def test_edit_cannot_overwrite_source_or_asset_scope(self):
+        for field, value in [('sources', []), ('selection', {}), ('claims', [])]:
+            with self.subTest(field=field):
+                revised = edited_topic(final_topic())
+                revised[field] = value
+                transport = self.full(edited=response({'topics': [revised]}))
+                with self.assertRaises(ProviderError):
+                    self.provider.discover_insights('operations')
+                self.assertEqual(len(transport.requests), 6)
+        revised = edited_topic(final_topic())
+        revised['ready_to_use']['format'] = 'brief'
+        self.full(edited=response({'topics': [revised]}))
+        with self.assertRaises(ProviderError):
+            self.provider.discover_insights('operations')
+
+    def test_unfinished_edit_is_rejected_before_audit(self):
+        revised = edited_topic(final_topic())
+        revised['ready_to_use']['body'] = '오류: ______\n연락처: ______'
+        transport = self.full(edited=response({'topics': [revised]}))
+        result = self.provider.discover_insights('operations')
+        self.assertEqual(result['topics'], [])
+        self.assertEqual(result['usage']['requests'], 6)
+        self.assertEqual(len(transport.requests), 6)
+
+    def test_final_audit_can_reject_unsupported_claim_introduced_by_edit(self):
+        revised = edited_topic(final_topic())
+        revised['summary'] = '이 연락문을 쓰면 수리 비용이 절반으로 줄어듭니다.'
+        transport = self.full(edited=response({'topics': [revised]}),
+                              audited=audit('P1', passed=False, reason='편집본의 비용 절감 주장은 근거가 없습니다.'))
+        result = self.provider.discover_insights('operations')
+        self.assertEqual(result['topics'], [])
+        self.assertEqual(result['selection_report']['rejected'][0]['reason'], '편집본의 비용 절감 주장은 근거가 없습니다.')
+        audit_input = json.loads(self.payloads(transport)[6]['input'][0]['content'])
+        self.assertEqual(audit_input['proposed_topics'][0]['summary'], revised['summary'])
+        self.assertEqual(len(transport.requests), 7)
+
+    def test_failed_edit_does_not_retry_or_publish_the_unedited_draft(self):
+        transport = self.full(edited=TimeoutError('private upstream details'))
+        with self.assertRaises(ProviderError) as caught:
+            self.provider.discover_insights('operations')
+        self.assertNotIn('private', str(caught.exception))
+        self.assertEqual(len(transport.requests), 6)
+
+    def test_editorial_incompleteness_rejects_a_factually_supported_topic(self):
+        checked = json.loads(audit('P1')['output'][0]['content'][0]['text'])
+        checked['decisions'][0]['asset_complete'] = False
+        checked['decisions'][0]['reason'] = '소식의 핵심보다 주의사항이 대부분을 차지합니다.'
+        self.full(audited=response(checked))
+        result = self.provider.discover_insights('briefing')
+        self.assertEqual(result['topics'], [])
+        self.assertEqual(result['selection_report']['rejected'][0]['reason'],
+                         '소식의 핵심보다 주의사항이 대부분을 차지합니다.')
 
     def test_total_threshold_and_top_three_ranking_are_enforced_locally(self):
         items = []
@@ -219,7 +510,7 @@ class InsightTests(unittest.TestCase):
         transport = self.full()
         self.provider.discover_insights('operations', history=history)
         requests = self.payloads(transport)
-        for index in [2, 5]:
+        for index in [2, 6]:
             public = json.loads(requests[index]['input'][0]['content'])['history']['recent_topics'][0]
             self.assertEqual(public['summary'], '요' * 400)
             self.assertEqual(public['change'], '변' * 400)
@@ -319,7 +610,7 @@ class InsightTests(unittest.TestCase):
         result = self.provider.discover_insights('operations')
         self.assertEqual(result['topics'], [])
         self.assertEqual(result['selection_report']['rejected'][0]['reason'], '과거 주제와 같은 문제이며 실제 정책 근거가 없습니다.')
-        self.assertEqual(len(transport.requests), 6)
+        self.assertEqual(len(transport.requests), 7)
 
     def test_empty_selection_is_success_and_does_not_spend_remaining_requests(self):
         transport = self.transport(*scouts(), selected())
@@ -332,7 +623,7 @@ class InsightTests(unittest.TestCase):
         transport = self.full(audited=audit())
         with self.assertRaises(ProviderError):
             self.provider.discover_insights('operations')
-        self.assertEqual(len(transport.requests), 6)
+        self.assertEqual(len(transport.requests), 7)
 
     def test_one_audit_failure_does_not_discard_an_independently_accepted_topic(self):
         second = candidate('P2')
@@ -350,10 +641,13 @@ class InsightTests(unittest.TestCase):
     def test_tool_action_cap_is_enforced_even_if_upstream_exceeds_request(self):
         raw = scouts()[0]
         raw['output'] = raw['output'][:-1] * 9 + raw['output'][-1:]
-        transport = self.transport(raw)
+        transport = self.transport(raw, scouts()[1])
         with self.assertRaises(ProviderError):
             self.provider.discover_insights('operations')
-        self.assertEqual(len(transport.requests), 1)
+        names = [request_stage(request) for request, _ in transport.requests]
+        self.assertIn('insight_clinic_scout', names)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(set(names) <= set(STAGES[:2]))
 
     def test_answer_source_cap_fails_before_final_generation(self):
         raw = narrative(ANSWER, '여섯 원문이 확인된 보고서입니다.')
@@ -373,11 +667,29 @@ class InsightTests(unittest.TestCase):
         self.assertEqual(len(transport.requests), 4)
 
     def test_failed_transport_does_not_retry(self):
-        transport = self.transport(TimeoutError('sensitive upstream details'))
+        transport = self.transport(TimeoutError('sensitive upstream details'), scouts()[1])
         with self.assertRaises(ProviderError) as caught:
             self.provider.discover_insights('briefing')
         self.assertNotIn('sensitive', str(caught.exception))
-        self.assertEqual(len(transport.requests), 1)
+        names = [request_stage(request) for request, _ in transport.requests]
+        self.assertIn('insight_clinic_scout', names)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(set(names) <= set(STAGES[:2]))
+
+    def test_failed_parallel_scout_cannot_publish_or_start_selection(self):
+        barrier = threading.Barrier(2, timeout=2)
+        fixture = InsightHTTPFixtures(scouts()[0], TimeoutError('private failure details'))
+
+        def request(request, timeout):
+            self.assertIn(request_stage(request), STAGES[:2])
+            barrier.wait()
+            return fixture(request, timeout)
+
+        with patch('brochure.provider.urlopen', request), self.assertRaises(ProviderError) as caught:
+            self.provider.discover_insights('operations')
+        self.assertNotIn('private failure', str(caught.exception))
+        self.assertEqual(sorted(request_stage(request) for request, _ in fixture.requests),
+                         list(STAGES[:2]))
 
 
 if __name__ == '__main__':

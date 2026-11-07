@@ -13,12 +13,13 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .provider import ProviderError
 from .service import AppError
+from .tracing import TraceStore, research_trace
 
 
 MAX_PENDING_JOBS = 16
@@ -66,6 +67,7 @@ class JobRunner:
             raise ValueError('daily_limit must be between 1 and 20')
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.traces = TraceStore(self.path.with_name('traces.sqlite3'))
         self.daily_limit = daily_limit
         self._lock = threading.RLock()
         self._closed = False
@@ -80,9 +82,12 @@ class JobRunner:
                 CREATE INDEX IF NOT EXISTS jobs_owner_date ON jobs(owner, created_at);
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
             ''')
+            interrupted = db.execute("SELECT id, owner FROM jobs WHERE status IN ('queued', 'running')").fetchall()
             db.execute('''UPDATE jobs SET status='interrupted', stage='작업 중단',
                 error=?, result=NULL, updated_at=? WHERE status IN ('queued', 'running')''',
                        (_INTERRUPTED, time.time()))
+        for row in interrupted:
+            self.traces.interrupt(row['owner'], row['id'])
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='brochure-job')
 
     @contextmanager
@@ -151,6 +156,7 @@ class JobRunner:
         with self._connect() as db:
             changed = db.execute("UPDATE jobs SET status='running', stage='작업 시작', updated_at=? WHERE id=? AND status='queued'",
                                  (time.time(), identifier)).rowcount
+            job = db.execute('SELECT owner, kind FROM jobs WHERE id=?', (identifier,)).fetchone()
         if not changed:
             return
 
@@ -167,7 +173,18 @@ class JobRunner:
                            (stage, time.time(), identifier))
 
         try:
-            result = _encoded(work(progress), MAX_RESULT_BYTES)
+            context = (research_trace(self.traces, identifier, job['owner'], job['kind'])
+                       if job['kind'] in ('research', 'briefing') else nullcontext())
+            with context as trace_run:
+                produced = work(progress)
+                result = _encoded(produced, MAX_RESULT_BYTES)
+            if getattr(trace_run, 'recording_failed', False):
+                # Observability failures must not discard completed paid work.
+                try:
+                    result = _encoded({**produced,
+                        'trace_notice': '조사 결과는 저장했지만 실행 기록 일부를 저장하지 못했습니다.'}, MAX_RESULT_BYTES)
+                except JobError:
+                    pass  # Keep the valid result if the optional notice exceeds its cap.
         except Exception as error:
             # These application exception types contain fixed, user-safe messages.
             # Unknown exceptions may contain prompts, credentials or response bodies.
@@ -219,6 +236,7 @@ class JobRunner:
                 raise JobError('작업을 찾을 수 없습니다.', 404)
             if row['status'] in _ACTIVE:
                 raise JobError('진행 중인 작업은 삭제할 수 없습니다.', 409)
+            self.traces.delete(owner, id)
             # Keep only the submission ledger; deletion never resets paid-work limits.
             db.execute('''UPDATE jobs SET result=NULL, error=NULL, stage='', deleted_at=?, updated_at=?
                 WHERE owner=? AND id=?''', (time.time(), time.time(), owner, id))
