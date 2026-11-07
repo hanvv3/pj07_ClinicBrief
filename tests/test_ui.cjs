@@ -77,6 +77,75 @@ function setup(options={}) {
 }
 async function fill(h,id,value,event='input'){const field=h.byId(id);assert.ok(field,'Missing field '+id);if(event==='change')field.checked=value;else field.value=value;await field.fire(event);}
 (async()=>{
+ // Trace viewing must open a real destination, render saved outputs safely, and never purchase work.
+ const traceId='0123456789abcdef0123456789abcdef';
+ const traceJob={id:traceId,kind:'research',status:'succeeded',stage:'완료',result:{topics:[]}};
+ // A partial trace storage failure must remain visible without hiding the successful research result.
+ const traceNotice='조사 결과는 저장했지만 실행 기록 일부를 저장하지 못했습니다.';
+ const noticeJob={...traceJob,result:{topics:[],trace_notice:traceNotice}};
+ const noticeView=setup({jobs:[noticeJob],briefing:{items:[],status:{...briefingStatus,last_attempt:{...noticeJob,kind:'briefing'}}}});
+ await settle();assert.ok(noticeView.root.textContent.includes(traceNotice));assert.match(noticeView.root.textContent,/마지막 수집을 마쳤습니다/);
+ await noticeView.find('button','직접 조사').fire('click');assert.ok(noticeView.root.textContent.includes(traceNotice));assert.ok(noticeView.find('button','선정하지 못한 이유 보기'));assert.ok(noticeView.find('button','조사 과정 보기'));
+ const traceCall={id:'call-1',name:'insight_clinic_scout',label:'의원 현장 조사',status:'succeeded',started_at:'2026-11-08T00:00:00Z',finished_at:'2026-11-08T00:00:01.250Z',duration_ms:1250,model:'gpt-5-mini',input_tokens:120,output_tokens:80,total_tokens:200,error:null,tools:[{type:'search',query:'의원 업무 공개 안내',url:null},{type:'open',query:null,url:'https://example.org/original'},{type:'open',query:null,url:'javascript:alert(1)'},{type:'find',query:'비용',url:'http://example.org/insecure'}],request:{instructions:'공개 자료 조사',input:'<img src=x onerror=alert(1)>'},response:{output:[{type:'message',content:[{type:'output_text',text:'실제로 읽은 원문에 대한 조사 결과 <script>alert(1)</script>'}]}]},response_id:'resp-saved'};
+ const traceData={id:traceId,kind:'research',status:'succeeded',started_at:'2026-11-08T00:00:00Z',finished_at:'2026-11-08T00:00:03.500Z',duration_ms:3500,error:null,usage:{requests:4,input_tokens:480,output_tokens:320,total_tokens:800},langsmith_url:'https://smith.langchain.com/public/example/r',calls:[traceCall,{...clone(traceCall),id:'call-2',name:'insight_tools_scout',label:'도구·제도 조사',tools:[]},{...clone(traceCall),id:'call-3',name:'insight_topics',label:'초안 작성',tools:[],response:{output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({topics:[{title:'편집 전 제목',summary:'편집 전 본문'}]})}]}]}},{...clone(traceCall),id:'call-4',name:'insight_edit',label:'문장 편집',tools:[],response:{output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({topics:[{title:'편집 후 제목',summary:'편집 후 본문'}]})}]}]}}]};
+ let finishTrace;
+ const traceView=setup({jobs:[traceJob],route:async url=>url===`/api/jobs/${traceId}/trace`?new Promise(resolve=>{finishTrace=resolve;}):null});
+ await settle();await traceView.find('button','직접 조사').fire('click');
+ const openingTrace=traceView.find('button','조사 과정 보기').fire('click');await settle();
+ assert.ok(traceView.byId('research-trace-panel'),'opening trace must create a visible panel, not merely refresh the job list');
+ assert.match(traceView.byId('research-trace-panel').textContent,/불러오고/);
+ assert.equal(traceView.document.activeElement,traceView.byId('research-trace-title'));
+ finishTrace({ok:true,status:200,json:async()=>({trace:clone(traceData)})});await openingTrace;
+ const tracePanel=traceView.byId('research-trace-panel');
+ for(const text of ['의원 현장 조사','도구·제도 조사','1.3초','3.5초','800','의원 업무 공개 안내','실제로 읽은 원문','편집 전 본문','편집 후 본문','<script>alert(1)</script>'])assert.ok(tracePanel.textContent.includes(text),`trace missing ${text}`);
+ const traceLinks=traceView.all(tracePanel).filter(n=>n.tagName==='A');assert.ok(traceLinks.some(n=>n.getAttribute('href')==='https://example.org/original'));assert.equal(traceLinks.some(n=>!n.getAttribute('href').startsWith('https://')),false);
+ assert.ok(traceView.all(tracePanel).filter(n=>n.tagName==='DETAILS').every(n=>!n.open),'stage results and raw input/output start collapsed');
+ assert.equal(traceView.all(tracePanel).some(n=>['SCRIPT','IMG'].includes(n.tagName)),false);
+ assert.equal(traceView.calls.some(c=>c.method!=='GET'||!c.url.startsWith('/api/')),false,'viewing saved trace must make only local GET requests');
+ await traceView.find('button','조사 과정 닫기').fire('click');assert.equal(traceView.byId('research-trace-panel'),undefined);
+ // Shared briefing uses its public endpoint, and missing old records are distinguishable from failed reads.
+ let traceStatus=404;
+ const sharedTrace=setup({briefing:{items:[],status:{...briefingStatus,last_attempt:{...traceJob,kind:'briefing'}}},route:async url=>url===`/api/briefing/trace/${traceId}`?{ok:false,status:traceStatus,json:async()=>({error:'temporary failure'})}:null});
+ await settle();await sharedTrace.find('button','조사 과정 보기').fire('click');assert.match(sharedTrace.byId('research-trace-panel').textContent,/저장된 조사 과정이 없습니다/);assert.equal(sharedTrace.calls.some(c=>c.url===`/api/jobs/${traceId}/trace`),false);
+ traceStatus=503;await sharedTrace.find('button','기록 새로고침').fire('click');assert.match(sharedTrace.byId('research-trace-panel').textContent,/불러오지 못했습니다/);assert.equal(sharedTrace.calls.some(c=>c.method==='POST'),false);
+ const failedTrace=setup({jobs:[{...traceJob,status:'failed'}],route:async url=>url.endsWith('/trace')?{ok:true,status:200,json:async()=>({trace:{...clone(traceData),status:'failed',error:'원문 확인에 실패했습니다.',calls:[{...clone(traceCall),status:'failed',duration_ms:null,input_tokens:null,output_tokens:null,total_tokens:null,error:'요청이 중단되었습니다.',response:null}]}})}:null});
+ await settle();await failedTrace.navSaved.fire('click');await failedTrace.find('button','조사 과정 보기').fire('click');assert.match(failedTrace.byId('research-trace-panel').textContent,/원문 확인에 실패했습니다/);assert.match(failedTrace.byId('research-trace-panel').textContent,/요청이 중단되었습니다/);assert.match(failedTrace.byId('research-trace-panel').textContent,/시간 미기록/);assert.equal(failedTrace.calls.some(c=>c.method==='POST'),false);
+ // Late reads cannot reopen closed panels or leak one session's records after logout.
+ for(const action of ['close','logout']){
+  let finishLate;
+  const lateTrace=setup({jobs:[{...traceJob,status:'running',result:null}],route:async url=>url.endsWith('/trace')?new Promise(resolve=>{finishLate=resolve;}):null});
+  await settle();await lateTrace.find('button','직접 조사').fire('click');const pending=lateTrace.find('button','조사 과정 보기').fire('click');await settle();
+  await lateTrace.find('button',action==='close'?'조사 과정 닫기':'로그아웃').fire('click');
+  finishLate({ok:true,status:200,json:async()=>({trace:clone(traceData)})});await pending;
+  assert.equal(lateTrace.byId('research-trace-panel'),undefined);assert.equal(lateTrace.root.textContent.includes('실제로 읽은 원문'),false);
+  assert.equal([...lateTrace.timers.values()].some(t=>t.ms===30000),false,'closing must clear the trace request timeout');
+ }
+ // Switching records invalidates the prior request, including a late authorization error.
+ const otherTraceId='fedcba9876543210fedcba9876543210';let finishOldTrace;
+ const switchedTrace=setup({jobs:[traceJob,{...traceJob,id:otherTraceId}],route:async url=>url===`/api/jobs/${traceId}/trace`?new Promise(resolve=>{finishOldTrace=resolve;}):url===`/api/jobs/${otherTraceId}/trace`?{ok:true,status:200,json:async()=>({trace:{...clone(traceData),id:otherTraceId,status:'running',duration_ms:null,usage:null,calls:[]}})}:null});
+ await settle();await switchedTrace.navSaved.fire('click');const oldRead=switchedTrace.byId(`trace-open-research-${traceId}`).fire('click');await settle();await switchedTrace.byId(`trace-open-research-${otherTraceId}`).fire('click');
+ finishOldTrace({ok:false,status:401,json:async()=>({error:'expired old request'})});await oldRead;
+ assert.ok(switchedTrace.byId('research-trace-panel'));assert.match(switchedTrace.byId('research-trace-panel').textContent,/아직 저장된 조사 단계가 없습니다/);assert.match(switchedTrace.byId('research-trace-panel').textContent,/아직 진행 중/);assert.equal(switchedTrace.root.textContent.includes('실제로 읽은 원문'),false);assert.ok(switchedTrace.find('button','로그아웃'),'a stale 401 cannot clear a later trace/session');
+ // A refreshed trace preserves the reader's expanded results and is removed with its job.
+ let updatedTrace=clone(traceData);
+ const refreshTrace=setup({jobs:[traceJob],route:async url=>url.endsWith('/trace')?{ok:true,status:200,json:async()=>({trace:clone(updatedTrace)})}:null});
+ await settle();await refreshTrace.navSaved.fire('click');await refreshTrace.find('button','조사 과정 보기').fire('click');
+ const outputDetails=refreshTrace.all(refreshTrace.byId('research-trace-panel')).find(n=>n.tagName==='DETAILS'&&n.textContent.includes('편집 전 초안 보기'));outputDetails.open=true;
+ updatedTrace.calls[2].response.output[0].content[0].text='새로 저장된 초안';await refreshTrace.find('button','기록 새로고침').fire('click');assert.ok(refreshTrace.byId(outputDetails.id).open);assert.match(refreshTrace.byId(outputDetails.id).textContent,/새로 저장된 초안/);
+ await refreshTrace.find('button','기록 삭제').fire('click');assert.equal(refreshTrace.byId('research-trace-panel'),undefined);
+ // A news brief with no useful example or qualification should not show empty panels.
+ const newsDraft=clone(baseDraft);newsDraft.brochure.example={heading:'',body:''};newsDraft.brochure.limitations=[];newsDraft.quality_notes=['출처 원문에 대한 내부 확인 메모'];
+ const newsView=setup({route:async(url,method)=>url==='/api/drafts'&&method==='POST'?{ok:true,status:200,json:async()=>newsDraft}:null});
+ await settle();await newsView.find('button','준비된 예제').fire('click');await newsView.find('button','예제 그대로 만들기').fire('click');
+ assert.equal(newsView.all().some(n=>n.className==='example-box'),false);
+ assert.equal(newsView.root.textContent.includes('제안된 활용 예시'),false);
+ assert.equal(newsView.root.textContent.includes('함께 확인할 사항'),false);
+ const reviewNotes=newsView.byId('editorial-review-notes');assert.ok(reviewNotes);assert.equal(Boolean(reviewNotes.open),false);assert.ok(reviewNotes.textContent.includes('출처 원문에 대한 내부 확인 메모'));
+ const briefTopic={...clone(insightTopic),summary:'새로 발표된 소식의 핵심 내용',ready_to_use:{...insightTopic.ready_to_use,format:'brief'}};
+ const briefView=setup({briefing:{items:[briefTopic],status:briefingStatus}});await settle();
+ assert.ok(briefView.find('summary','소식 읽기'));
+ assert.equal(briefView.root.textContent.includes('해결하려는 문제'),false);
+ assert.ok(briefView.all().some(n=>n.className==='insight-problem'&&n.textContent.includes(briefTopic.summary)));
  // A late research read must respect a workspace opened and edited while polling was in flight.
  const raceTopic={...topic,id:'late-topic',title:'늦게 도착한 조사'};
  const raceDone={id:'late-research',kind:'research',status:'succeeded',stage:'완료',result:{topics:[raceTopic]}};
@@ -203,5 +272,5 @@ async function fill(h,id,value,event='input'){const field=h.byId(id);assert.ok(f
  const activeAttempt=setup({jobs:[{id:'saved-success',kind:'compose',status:'succeeded',stage:'지난 구성 완료',result:{draft:clone(baseDraft)}},{id:'active-attempt',kind:'research',status:'running',stage:'현재 조사 진행 중'}]});await settle();assert.match(activeAttempt.root.textContent,/현재 조사 진행 중/);assert.equal(activeAttempt.root.textContent.includes('지난 구성 완료'),false,'an active job takes precedence over terminal records');
  // A sender edit must immediately disable the revision button too.
  const dirty=setup({jobs:[{id:'d',kind:'compose',status:'running'}]});await settle();dirty.setJobs([{id:'d',kind:'compose',status:'succeeded',result:{draft:clone(baseDraft)}}]);await dirty.tick();await fill(dirty,'revision-instructions','명확하게 수정');await fill(dirty,'revision-confirmed',true,'change');assert.equal(dirty.find('button','두 자료 함께 수정').disabled,false);await fill(dirty,'sender-name','새 이름');assert.equal(dirty.find('button','두 자료 함께 수정').disabled,true);
- console.log('PASS: insight evidence/ready assets/copy/feedback persistence and races/zero selection/broad category, briefing polling/recovery, session/CSRF, examples, source dates, review/export gates, request identity/reload, company consent and revisions');
+ console.log('PASS: trace viewer/loading/empty/failure/safe output/GET-only/races/deletion, insight evidence/ready assets/copy/feedback persistence and races/zero selection/broad category, briefing polling/recovery, session/CSRF, examples, source dates, review/export gates, request identity/reload, company consent and revisions');
 })().catch(e=>{console.error(e);process.exitCode=1;});

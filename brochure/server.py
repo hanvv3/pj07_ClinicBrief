@@ -189,6 +189,20 @@ def make_server(service, port=8765, provider=None, auth=None, jobs=None, briefin
                     return self.send_json(202,workflows.compose(owner,self.json_body()))
                 if method == 'GET' and path == '/api/jobs':
                     return self.send_json(200,{'jobs':jobs.list(owner)})
+                trace_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/trace', path)
+                if method == 'GET' and trace_match:
+                    identifier = trace_match.group(1)
+                    job = jobs.get(owner, identifier)
+                    trace = jobs.traces.get(owner, identifier) if job['kind'] == 'research' else None
+                    if trace is None:
+                        raise AppError('아직 저장된 조사 과정이 없습니다. 이전 버전의 작업에는 기록이 없을 수 있습니다.', 404)
+                    return self.send_json(200, {'trace': trace})
+                shared_trace_match = re.fullmatch(r'/api/briefing/trace/([a-f0-9]{32})', path)
+                if method == 'GET' and shared_trace_match:
+                    trace = briefing.get_trace(shared_trace_match.group(1))
+                    if trace is None:
+                        raise AppError('저장된 수집 과정이 없습니다. 이전 버전의 작업에는 기록이 없을 수 있습니다.', 404)
+                    return self.send_json(200, {'trace': trace})
                 job_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})',path)
                 if job_match:
                     if method == 'GET':

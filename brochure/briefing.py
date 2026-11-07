@@ -241,6 +241,12 @@ class BriefingService:
     def get_topic(self, id):
         return next((copy.deepcopy(topic) for topic in self._items(self._now()) if topic['id'] == id), None)
 
+    def get_trace(self, identifier):
+        # Shared runs contain only public research. Personal jobs never enter this ledger.
+        if not any(job['id'] == identifier for job in self._ledger()):
+            return None
+        return self.jobs.traces.get(_OWNER, identifier)
+
     def refresh(self, request_id):
         history = None
 

@@ -61,11 +61,15 @@ def _public_content(draft):
                 raise ValueError("본문의 출처 식별자에 해당하는 자료가 없습니다.")
             sections.append({"heading": _text(section["heading"], "제목"), "body": _text(section["body"], "본문"), "source_ids": references})
         sender = brochure["sender"]
+        example = {key: _text(brochure["example"][key], "제안 예시").strip()
+                   for key in ("heading", "body")}
+        if bool(example["heading"]) != bool(example["body"]):
+            raise ValueError("예시를 넣으려면 제목과 내용을 함께 작성해 주세요.")
         return {
             "title": _text(brochure["title"], "자료 제목"),
             "intro": _text(brochure["intro"], "소개"),
             "sections": sections,
-            "example": {key: _text(brochure["example"][key], "제안 예시") for key in ("heading", "body")},
+            "example": example,
             "limitations": [_text(value, "확인할 한계") for value in brochure["limitations"]],
             "sender": {key: _text(sender.get(key, ""), "담당자 정보") for key in ("name", "contact")},
             "sources": sources,
@@ -175,8 +179,6 @@ def render_docx(draft: dict, output_path: Path) -> Path:
     document.core_properties.title = content["title"]
     document.add_paragraph(content["title"], "Title")
     _paragraphs(document, content["intro"])
-    document.add_paragraph(f"자료 확인일  {content['research_date']}", "Evidence")
-    _paragraphs(document, content["evidence_notice"], "Evidence")
     for section in content["sections"]:
         document.add_paragraph(section["heading"], "Heading 1")
         paragraph = _paragraphs(document, section["body"])
@@ -187,8 +189,9 @@ def render_docx(draft: dict, output_path: Path) -> Path:
             citation = document.add_paragraph(" ".join(f"[{source_id}]" for source_id in section["source_ids"]), "Attribution")
             citation.paragraph_format.keep_together = True
     application_start = len(document.paragraphs)
-    document.add_paragraph("제안 예시  " + content["example"]["heading"], "Heading 1")
-    _paragraphs(document, content["example"]["body"])
+    if content["example"]["body"]:
+        document.add_paragraph("제안 예시  " + content["example"]["heading"], "Heading 1")
+        _paragraphs(document, content["example"]["body"])
     if content["limitations"]:
         document.add_paragraph("검토 시 유의사항", "Heading 1")
         for limitation in content["limitations"]:
@@ -208,6 +211,8 @@ def render_docx(draft: dict, output_path: Path) -> Path:
                          f"원문 확인일 {source['checked_at']}")
             paragraph.add_run().add_break()
             paragraph.add_run(dates)
+    document.add_paragraph(f"자료 확인일  {content['research_date']}", "Evidence")
+    _paragraphs(document, content["evidence_notice"], "Evidence")
     sender = content["sender"]
     if sender["name"] or sender["contact"]:
         paragraph = document.add_paragraph(style="Sender")

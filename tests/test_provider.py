@@ -582,6 +582,46 @@ class ProviderTests(unittest.TestCase):
             with self.assertRaises(self.ProviderError):
                 self.provider.discover('communication')
 
+    def test_news_brochure_can_omit_unneeded_example_and_limitations(self):
+        data = composed()
+        data['brochure']['example'] = {'heading': '', 'body': ''}
+        data['brochure']['limitations'] = []
+        transport = self.transport(response(data), response(accepted_audit()))
+        result = self.provider.compose(load_topics()[0])
+        self.assertEqual(result['brochure']['example'], {'heading': '', 'body': ''})
+        self.assertEqual(result['brochure']['limitations'], [])
+        self.assertEqual(len(transport.requests), 2)
+
+    def test_half_empty_optional_example_is_rejected_before_audit(self):
+        for example in ({'heading': '예시', 'body': ''}, {'heading': '', 'body': '예시 본문'}):
+            data = composed()
+            data['brochure']['example'] = example
+            transport = self.transport(response(data))
+            with self.assertRaises(self.ProviderError):
+                self.provider.compose(load_topics()[0])
+            self.assertEqual(len(transport.requests), 1)
+
+    def test_composition_and_audit_load_shared_editorial_guidance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompts = Path(directory)
+            (prompts / 'editorial.md').write_text('SHARED_EDITORIAL_POLICY', encoding='utf-8')
+            (prompts / 'editorial-examples.md').write_text('FICTIONAL_STYLE_EXAMPLES', encoding='utf-8')
+            transport = self.transport(response(composed()), response(accepted_audit()))
+            with patch('brochure.editorial.PROMPT_DIR', prompts):
+                self.provider.compose(load_topics()[0])
+        requests = [json.loads(request.data) for request, _ in transport.requests]
+        self.assertTrue(all('SHARED_EDITORIAL_POLICY' in item['instructions'] for item in requests))
+        self.assertIn('FICTIONAL_STYLE_EXAMPLES', requests[0]['instructions'])
+
+    def test_editorial_rejection_does_not_require_factual_failure(self):
+        rejected = accepted_audit()
+        rejected['consistent'] = False
+        rejected['quality_notes'] = ['본문 대부분이 편집 주의사항이라 소식의 핵심이 드러나지 않습니다.']
+        transport = self.transport(response(composed()), response(rejected))
+        with self.assertRaises(self.ProviderError):
+            self.provider.compose(load_topics()[0])
+        self.assertEqual(len(transport.requests), 2)
+
     def test_composition_and_audit_have_no_tools_private_inputs_or_sender_leakage(self):
         old = composed()
         old['brochure']['sender'] = {'name': 'PRIVATE SENDER', 'contact': 'private@example.com'}

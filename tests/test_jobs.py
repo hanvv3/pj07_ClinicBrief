@@ -66,6 +66,23 @@ class JobTests(unittest.TestCase):
         self.assertEqual(final['result'], {'value': 'finished'})
         self.assertFalse(self.runner.active('alice'))
 
+    def test_trace_write_failure_keeps_successful_research_and_reports_missing_record(self):
+        original = self.runner.traces._update
+
+        def fail_only_trace_completion(*args, **kwargs):
+            if kwargs.get('status') == 'completed':
+                raise sqlite3.OperationalError('fixture trace-only storage failure')
+            return original(*args, **kwargs)
+
+        with patch.object(self.runner.traces, '_update', side_effect=fail_only_trace_completion):
+            job = self.runner.submit('alice', 'research', 'trace-write-failure', {},
+                                     lambda progress: {'topics': [], 'complete': True})
+            result = self.wait_terminal(job)
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertIs(result['result']['complete'], True)
+        self.assertIn('기록', result['result']['trace_notice'])
+        self.assertNotIn('fixture', result['result']['trace_notice'])
+
     def test_concurrent_duplicate_submission_runs_work_once(self):
         work, started, release = self.blocked_work()
         calls = []

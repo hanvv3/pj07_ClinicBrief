@@ -39,6 +39,13 @@ def final_schema(verified_sources, candidate_ids):
     return schema
 
 
+def edit_schema(topic_ids):
+    topic = obj(id={'type': 'string', 'enum': list(topic_ids)}, title=string(100),
+                summary=string(400), director_value=string(500), takeaway=string(500),
+                why_now=string(400), ready_to_use=obj(title=string(120), body=string(3000)))
+    return obj(topics=array(topic, len(topic_ids), len(topic_ids)))
+
+
 def audit_schema(candidate_ids):
     decision = obj(id={'type': 'string', 'enum': list(candidate_ids)},
                    **{flag: {'type': 'boolean'} for flag in AUDIT_FLAGS}, reason=string(400, 0))

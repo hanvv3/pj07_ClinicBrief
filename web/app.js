@@ -18,7 +18,7 @@
     feedbackPending: new Set(), feedbackErrors: {}, copyMessages: {},
     selected: null, compose: { mode: 'ai', companyText: '', confirmed: false, name: '', contact: '' },
     revision: { instructions: '', confirmed: false }, appliedJobs: new Set(), pendingRequests: {},
-    researchResult: null, destinationFocus: null,
+    researchResult: null, destinationFocus: null, traceView: null,
 
   };
   const statusLabels = { draft: '검토 전', reviewed: '검토 완료', exported: '파일 준비 완료' };
@@ -289,6 +289,163 @@
   }
   const jobLabels = { research: '공개 출처 조사', compose: '두 자료 구성', revise: '두 자료 수정' };
   const jobStatusLabels = { queued: '대기 중', running: '진행 중', succeeded: '완료', failed: '실패', interrupted: '중단됨' };
+  const traceStageLabels = {
+    insight_clinic_scout: '의원 현장 조사', insight_tools_scout: '도구·제도 조사',
+    insight_selection: '주제 선정', insight_answer_research: '답변 근거 확인',
+    insight_topics: '초안 작성', insight_edit: '문장 편집', insight_audit: '최종 검수',
+  };
+  function traceButton(job, kind = 'research') {
+    if (!/^[a-f0-9]{32}$/i.test(job?.id || '')) return null;
+    const control = button('조사 과정 보기', 'text-button trace-open', () => openTrace(job.id, kind));
+    control.setAttribute('id', `trace-open-${kind}-${job.id}`);
+    control.setAttribute('aria-controls', 'research-trace-panel');
+    control.setAttribute('aria-expanded', String(state.traceView?.id === job.id && state.traceView?.kind === kind));
+    return control;
+  }
+  function closeTrace(restoreFocus = true) {
+    const view = state.traceView;
+    state.traceView = null;
+    if (!view) return;
+    clearTimeout(view.timeout); view.controller?.abort();
+    if (restoreFocus) {
+      render();
+      (document.getElementById(`trace-open-${view.kind}-${view.id}`) || main).focus({ preventScroll: true });
+    }
+  }
+  async function openTrace(id, kind) {
+    if (!state.session?.user) return;
+    closeTrace(false);
+    state.traceView = { id, kind, data: null, loading: false, missing: false, error: '', controller: null, timeout: null };
+    const loading = loadTrace();
+    document.getElementById('research-trace-title')?.focus({ preventScroll: true });
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    await loading;
+  }
+  async function loadTrace() {
+    const view = state.traceView;
+    if (!state.session?.user || !view || view.loading) return;
+    const epoch = state.epoch;
+    const current = () => state.traceView === view && state.epoch === epoch && !!state.session?.user;
+    view.loading = true; view.error = ''; view.missing = false;
+    view.controller = new AbortController();
+    view.timeout = setTimeout(() => view.controller.abort(), 30000);
+    render();
+    try {
+      const endpoint = view.kind === 'briefing' ? `/api/briefing/trace/${view.id}` : `/api/jobs/${view.id}/trace`;
+      const response = await fetch(endpoint, { method: 'GET', credentials: 'same-origin', headers: { Accept: 'application/json' }, signal: view.controller.signal });
+      if (!current()) return;
+      if (response.status === 401) { clearSession(); render(); return; }
+      if (response.status === 404) { view.data = null; view.missing = true; return; }
+      if (!response.ok) throw new Error('Trace unavailable');
+      const data = await response.json();
+      if (!current()) return;
+      if (!data.trace || !Array.isArray(data.trace.calls)) throw new Error('Invalid trace');
+      view.data = data.trace;
+      announce('저장된 조사 과정을 열었습니다.');
+    } catch {
+      if (current()) view.error = '조사 과정을 불러오지 못했습니다. 기록 새로고침을 눌러 다시 확인해주세요.';
+    } finally {
+      clearTimeout(view.timeout);
+      if (current()) { view.loading = false; view.controller = null; render(); }
+    }
+  }
+  function traceDuration(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '시간 미기록';
+    if (value < 60000) return `${(value / 1000).toFixed(1).replace(/\.0$/, '')}초`;
+    return `${Math.floor(value / 60000)}분 ${Math.round((value % 60000) / 1000)}초`;
+  }
+  function traceCount(value) { return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value.toLocaleString('ko-KR') : null; }
+  function traceLink(value, label) {
+    try {
+      const url = new URL(value);
+      if (url.protocol !== 'https:' || url.username || url.password) return el('span', '', label);
+      const link = el('a', 'source-link', label);
+      link.setAttribute('href', url.href); link.setAttribute('target', '_blank'); link.setAttribute('rel', 'noopener noreferrer');
+      link.setAttribute('aria-label', `${label} (새 창)`);
+      return link;
+    } catch { return el('span', '', label); }
+  }
+  function traceOutput(response) {
+    if (!response) return null;
+    const parts = Array.isArray(response.output) ? response.output.filter(item => item.type === 'message').flatMap(item => (item.content || []).filter(part => part.type === 'output_text' && typeof part.text === 'string').map(part => part.text)) : [];
+    const text = parts.join('\n\n') || (typeof response.output_text === 'string' ? response.output_text : '');
+    if (!text) return null;
+    try { return JSON.parse(text); } catch { return text; }
+  }
+  function traceOutputContent(value, depth = 0) {
+    const labels = { topics: '주제', candidates: '후보', title: '제목', summary: '요약', body: '본문', heading: '소제목', reason: '이유', selection: '선정 근거', ready_to_use: '완성 자료', adaptation_note: '사용 시 참고', why_now: '지금 읽을 이유', question: '질문', answer: '답변', problem: '독자의 상황·질문', audience: '대상', sources: '출처', source_ids: '출처 번호', quality_notes: '검토 메모', approved: '통과 여부', issues: '검수 결과', edits: '편집 결과' };
+    if (value === null || value === undefined) return el('p', 'trace-output-text', '기록 없음');
+    if (typeof value !== 'object') return el('p', 'trace-output-text', typeof value === 'boolean' ? value ? '예' : '아니요' : value);
+    if (depth >= 4) return el('pre', 'trace-raw', JSON.stringify(value, null, 2));
+    if (Array.isArray(value)) {
+      if (!value.length) return el('p', 'muted small', '없음');
+      const list = el('ol', 'trace-output-list');
+      value.forEach(item => append(list, append(el('li'), traceOutputContent(item, depth + 1))));
+      return list;
+    }
+    const fields = el('dl', 'trace-output-fields');
+    for (const [key, item] of Object.entries(value)) append(fields, el('dt', '', labels[key] || key), append(el('dd'), traceOutputContent(item, depth + 1)));
+    return fields;
+  }
+  function traceDetails(id, label, content, className = '') {
+    const details = el('details', `trace-details ${className}`); details.setAttribute('id', id);
+    append(details, el('summary', '', label), content); return details;
+  }
+  function traceCallCard(call, index, traceId) {
+    const card = el('article', 'trace-call');
+    const label = call.label || traceStageLabels[call.name] || `조사 단계 ${index + 1}`;
+    const status = jobStatusLabels[call.status] || (call.status === 'completed' ? '완료' : '상태 미기록');
+    const header = append(el('div', 'trace-call-heading'), el('h3', '', label), tag(status, ['succeeded', 'completed'].includes(call.status) ? 'green' : ''));
+    const scout = call.name === 'insight_clinic_scout' ? 1 : call.name === 'insight_tools_scout' ? 2 : null;
+    if (scout) append(header, el('span', 'trace-parallel', `병렬 조사 ${scout}`));
+    append(card, header, el('p', 'trace-call-meta', `${traceDuration(call.duration_ms)} · ${traceCount(call.total_tokens) === null ? '토큰 미기록' : `총 ${traceCount(call.total_tokens)}토큰`}`));
+    if (call.error) append(card, el('p', 'trace-error', call.error));
+    if (Array.isArray(call.tools) && call.tools.length) {
+      const tools = el('ul', 'trace-tools');
+      for (const action of call.tools) {
+        const actionLabel = ({ search: '검색', open: '원문 열기', open_page: '원문 열기', find: '페이지에서 찾기', find_in_page: '페이지에서 찾기' })[action.type] || '출처 확인';
+        const item = append(el('li'), el('strong', '', actionLabel));
+        if (action.query) append(item, el('span', '', action.query));
+        if (action.url) append(item, traceLink(action.url, action.url));
+        append(tools, item);
+      }
+      append(card, traceDetails(`trace-tools-${traceId}-${index}`, `검색·원문 확인 ${call.tools.length}건`, tools));
+    }
+    const output = traceOutput(call.response);
+    const outputLabel = call.name === 'insight_topics' ? '편집 전 초안 보기' : call.name === 'insight_edit' ? '편집한 결과 보기' : '단계 결과 보기';
+    append(card, traceDetails(`trace-output-${traceId}-${index}`, outputLabel, output === null ? el('p', 'muted small', ['queued', 'running'].includes(call.status) ? '이 단계의 응답을 기다리고 있습니다.' : '저장된 응답 본문이 없습니다.') : traceOutputContent(output)));
+    const raw = el('div', 'trace-request-response');
+    append(raw, el('p', 'small muted', [`모델 ${call.model || '미기록'}`, `입력 ${traceCount(call.input_tokens) ?? '미기록'}토큰`, `출력 ${traceCount(call.output_tokens) ?? '미기록'}토큰`, call.started_at ? `시작 ${koreanTime(call.started_at)}` : '', call.finished_at ? `종료 ${koreanTime(call.finished_at)}` : ''].filter(Boolean).join(' · ')),
+      el('h4', '', '요청 내용'), el('pre', 'trace-raw', call.request == null ? '저장된 요청이 없습니다.' : JSON.stringify(call.request, null, 2)),
+      el('h4', '', '응답 내용'), el('pre', 'trace-raw', call.response == null ? '저장된 응답이 없습니다.' : JSON.stringify(call.response, null, 2)));
+    append(card, traceDetails(`trace-raw-${traceId}-${index}`, '상세 요청·응답 보기', raw));
+    return card;
+  }
+  function tracePanel() {
+    const view = state.traceView;
+    const panel = el('section', 'page research-trace-panel'); panel.setAttribute('id', 'research-trace-panel'); panel.setAttribute('aria-labelledby', 'research-trace-title'); panel.setAttribute('aria-busy', String(view.loading));
+    const title = el('h2', '', '조사 과정'); title.setAttribute('id', 'research-trace-title'); title.tabIndex = -1;
+    append(panel, append(el('div', 'trace-heading'), append(el('div'), el('p', 'eyebrow', view.kind === 'briefing' ? '새 소식 수집 기록' : '내 조사 기록'), title), button('조사 과정 닫기', 'text-button', () => closeTrace())), el('p', 'muted small', '저장된 조사·작성·편집 결과를 확인합니다. 기록 조회는 새 조사를 실행하지 않습니다.'));
+    const refresh = button('기록 새로고침', 'button secondary small-button', loadTrace, view.loading); refresh.setAttribute('id', 'trace-refresh');
+    append(panel, append(el('div', 'trace-controls'), refresh, el('span', 'muted small', '로컬 실행 기록')));
+    if (view.loading) { const loading = el('p', 'trace-message', '조사 과정을 불러오고 있습니다.'); loading.setAttribute('role', 'status'); append(panel, loading); }
+    if (view.error) { const error = el('p', 'trace-error', view.error); error.setAttribute('role', 'alert'); append(panel, error); }
+    if (view.missing) append(panel, el('p', 'trace-message', '저장된 조사 과정이 없습니다. 기록 기능을 추가하기 전의 작업이거나 기록이 삭제되었을 수 있습니다.'));
+    const trace = view.data;
+    if (!trace) return panel;
+    const status = jobStatusLabels[trace.status] || (trace.status === 'completed' ? '완료' : '상태 미기록');
+    const meta = append(el('div', 'trace-overview'), tag(status, ['succeeded', 'completed'].includes(trace.status) ? 'green' : ''), el('span', '', `전체 ${traceDuration(trace.duration_ms)}`));
+    if (trace.started_at) append(meta, el('span', '', `시작 ${koreanTime(trace.started_at)}`));
+    if (traceCount(trace.usage?.requests) !== null) append(meta, el('span', '', `요청 ${traceCount(trace.usage.requests)}회`));
+    if (traceCount(trace.usage?.total_tokens) !== null) append(meta, el('span', '', `총 ${traceCount(trace.usage.total_tokens)}토큰`));
+    append(panel, meta);
+    if (trace.langsmith_url) append(panel, traceLink(trace.langsmith_url, 'LangSmith에서 상세 기록 보기'));
+    if (trace.error) append(panel, el('p', 'trace-error', trace.error));
+    if (['queued', 'running'].includes(trace.status)) append(panel, el('p', 'trace-message', '아직 진행 중입니다. 기록 새로고침으로 완료된 단계와 새 응답을 확인할 수 있습니다.'));
+    if (!trace.calls.length) append(panel, el('p', 'trace-message', '아직 저장된 조사 단계가 없습니다.'));
+    trace.calls.forEach((call, index) => append(panel, traceCallCard(call, index, trace.id)));
+    return panel;
+  }
   function activeJob() { return state.jobs.some(job => ['queued', 'running'].includes(job.status)); }
   function stopPolling() { clearTimeout(state.pollTimer); state.pollTimer = null; }
   function briefingVisible() { return !!state.session?.user && state.page === 'topics' && state.discovery === 'briefing' && !document.hidden; }
@@ -357,6 +514,7 @@
     });
   }
   function clearSession() {
+    closeTrace(false);
     stopPolling(); stopBriefingPolling(); state.epoch += 1;
     state.session = null; state.active = null; state.drafts = []; state.research = []; state.jobs = [];
     state.researchResult = null; state.destinationFocus = null;
@@ -519,6 +677,7 @@
   function removeJobSnapshots(matches) {
     const removed = new Set(state.jobs.filter(matches).map(job => job.id));
     state.jobs = state.jobs.filter(job => !removed.has(job.id));
+    if (state.traceView?.kind === 'research' && removed.has(state.traceView.id)) closeTrace(false);
     if (removed.has(state.researchResult?.id)) {
       state.researchResult = null;
       if (state.page === 'research-result') { state.page = 'topics'; state.discovery = 'research'; state.destinationFocus = 'main-content'; }
@@ -590,7 +749,7 @@
       for (const [value, text] of [['briefing', '전체 분야에서 찾기'], ['communication', '진료 설명·직원 소통·환자 안내'], ['operations', '예약·장비·행정·의원 운영'], ['ai-literacy', 'AI 설정·문서 작업·업무 활용']]) { const option = el('option', '', text); option.value = value; option.selected = state.category === value; append(select, option); }
       select.value = state.category; select.addEventListener('change', event => { state.category = event.target.value; });
       append(controls, append(el('div', 'category-field'), label, select), button('실시간 조사 시작', 'button primary', () => submitJob('/api/research', { category: state.category }, '공개 출처 조사를 요청하고 있습니다.'), !state.session?.provider?.configured || activeJob()));
-      append(panel, controls, el('p', 'discovery-help', '공개된 의원의 질문·업무 사례와 도구·제도 자료를 살펴보고, 바로 쓸 자료를 만들 수 있는 주제를 최대 3개 고릅니다. 충분한 근거와 활용 가치가 없으면 새 주제를 추가하지 않습니다.'));
+      append(panel, controls, el('p', 'discovery-help', '공개된 의원의 글과 기관·제품 자료를 살펴보고, 읽을 만한 소식이나 바로 쓸 자료를 최대 3개 준비합니다. 근거와 독자에게 줄 내용이 충분한 주제를 고릅니다.'));
     }
     return panel;
   }
@@ -607,6 +766,7 @@
       const count = researchDone ? job.result.topics.length : null;
       const status = researchDone ? count ? `주제 ${count}개 선정` : '선정 주제 없음' : jobStatusLabels[job.status] || job.status;
       const content = append(el('div', 'job-content'), append(el('div', 'job-meta'), tag(status, job.status === 'succeeded' && count !== 0 ? 'green' : ''), el('strong', '', jobLabels[job.kind] || 'AI 작업')), el('p', 'small', job.stage || '상태 확인 중'), job.error ? el('p', 'job-error', job.error) : null);
+      if (job.result?.trace_notice) append(content, el('p', 'small muted', job.result.trace_notice));
       if (researchDone) {
         const report = job.result.selection_report;
         if (report) append(content, el('p', 'small', `원문 ${report.sources_read}개 확인 · 후보 ${report.candidates_considered}개 검토`));
@@ -614,6 +774,7 @@
       }
       append(card, content);
       const controls = el('div', 'job-actions');
+      if (job.kind === 'research') append(controls, traceButton(job));
       const label = researchDone ? count ? `선정한 주제 ${count}개 보기` : '선정하지 못한 이유 보기' : '작성 자료 열기';
       if (job.status === 'succeeded' && (researchDone || job.result?.draft)) append(controls, button(label, 'button secondary small-button', () => act('작업 결과를 열고 있습니다.', async () => { await applyCompletedJob(job, true); state.notice = ''; })));
       if (!['queued', 'running'].includes(job.status) && history) append(controls, button('기록 삭제', 'text-button delete-button', () => deleteJob(job)));
@@ -695,8 +856,9 @@
     const selection = topic.selection;
     if (!selection) return null;
     const context = el('div', 'insight-context');
+    const isBrief = topic.ready_to_use?.format === 'brief';
     const audiences = { director: '원장님', staff: '직원', both: '원장님과 직원' };
-    append(context, append(el('div', 'insight-audience'), tag(`활용 대상 · ${audiences[selection.audience] || '대상 확인 필요'}`), selection.novelty === 'update' ? tag('업데이트') : null), append(el('div', 'insight-problem'), el('span', 'mini-label', '해결하려는 문제'), el('p', '', selection.problem)));
+    append(context, append(el('div', 'insight-audience'), tag(`${isBrief ? '추천 독자' : '활용 대상'} · ${audiences[selection.audience] || '대상 확인 필요'}`), selection.novelty === 'update' ? tag('업데이트') : null), append(el('div', 'insight-problem'), el('span', 'mini-label', isBrief ? '이 소식의 핵심' : '해결하려는 문제'), el('p', '', isBrief ? (topic.summary || selection.problem) : selection.problem)));
     const evidence = el('details', 'insight-signals'); evidence.setAttribute('id', `insight-signals-${topicKey(source, topic)}`);
     append(evidence, el('summary', '', '선정 근거와 관찰한 내용'));
     if (topic.summary) append(evidence, append(el('div', 'insight-context-note'), el('span', 'mini-label', '자료 요약'), el('p', '', topic.summary)));
@@ -716,9 +878,9 @@
     if (!ready?.body) return null;
     const key = topicKey(source, topic);
     const details = el('details', 'ready-material'); details.setAttribute('id', `ready-material-${key}`);
-    append(details, el('summary', '', '바로 쓸 자료 보기'));
+    append(details, el('summary', '', ready.format === 'brief' ? '소식 읽기' : '바로 쓸 자료 보기'));
     const content = el('div', 'ready-content');
-    const formats = { prompt: 'AI 질문문', message: '안내문', checklist: '체크리스트', comparison: '비교 자료', brief: '요약 자료' };
+    const formats = { prompt: 'AI 질문문', message: '안내문', checklist: '체크리스트', comparison: '비교 자료', brief: '소식·해설' };
     const body = el('textarea', 'ready-body', ready.body);
     body.value = ready.body; body.readOnly = true; body.rows = 14;
     body.setAttribute('id', `ready-body-${key}`); body.setAttribute('aria-label', '복사할 자료 본문');
@@ -791,6 +953,8 @@
       const noNewTopic = attempt.status === 'succeeded' && attempt.result?.selection_report?.selected_count === 0;
       append(progress, tag(running ? '새 소식 수집 중' : jobStatusLabels[attempt.status] || '수집 기록', attempt.status === 'succeeded' ? 'green' : ''), el('p', '', running ? '공개 원문을 확인하고 있습니다. 먼저 모아 둔 글은 계속 읽을 수 있습니다.' : noNewTopic ? '이번에는 새로 제안할 만한 주제를 찾지 못했습니다. 이전에 모은 글은 그대로 남아 있습니다.' : attempt.status === 'succeeded' ? '마지막 수집을 마쳤습니다. 각 글의 출처 날짜를 따로 확인하세요.' : attempt.error || '이번 수집을 마치지 못했습니다. 이전에 모은 글은 그대로 남아 있습니다.'));
       if (attempt.status === 'failed' || attempt.status === 'interrupted') append(progress, el('p', 'briefing-preserved', '이전에 모은 글은 유지됩니다. 실패한 수집은 자동으로 다시 실행하지 않습니다.'));
+      if (attempt.result?.trace_notice) append(progress, el('p', 'briefing-preserved', attempt.result.trace_notice));
+      append(progress, traceButton(attempt, 'briefing'));
       append(schedule, progress);
       append(schedule, selectionReport(attempt.result?.selection_report, `briefing-${attempt.id}`));
     }
@@ -913,7 +1077,7 @@
     const paper = el('article', 'document-paper');
     append(paper, append(el('div', 'document-topline'), el('span', 'eyebrow', 'CLINIC BRIEF'), el('span', '', '원장님께 드리는 안내자료')), el('h2', 'document-title', brochure.title), el('p', 'document-intro', brochure.intro));
     for (const section of brochure.sections || []) append(paper, append(el('section', 'document-section'), el('h3', '', section.heading), el('p', '', section.body), citations(section.source_ids)));
-    if (brochure.example) append(paper, append(el('section', 'example-box'), el('span', 'mini-label', '제안된 활용 예시 · 실제 기관 사례 아님'), el('h3', '', brochure.example.heading), el('p', '', brochure.example.body)));
+    if (brochure.example?.heading?.trim() && brochure.example?.body?.trim()) append(paper, append(el('section', 'example-box'), el('span', 'mini-label', '활용 예시'), el('h3', '', brochure.example.heading), el('p', '', brochure.example.body)));
     if (brochure.limitations?.length) append(paper, append(el('section', 'document-section limitations'), el('h3', '', '함께 확인할 사항'), append(el('ul'), ...brochure.limitations.map(item => el('li', '', item)))));
     const sender = brochure.sender || {};
     if (sender.name || sender.contact) append(paper, append(el('div', 'document-sender'), el('span', 'mini-label', '전달자'), sender.name ? el('p', 'sender-display-name', sender.name) : null, sender.contact ? el('p', '', sender.contact) : null));
@@ -1047,7 +1211,11 @@
     append(evidence, el('summary', '', `출처와 적용 범위 확인 (${draft.sources.length})`), el('p', 'evidence-notice', draft.evidence_notice), sourceDetails(draft.sources));
     append(left, evidence, revisionPanel());
     if (draft.input_notice) append(left, append(el('div', 'notice input-notice'), el('p', '', draft.input_notice)));
-    if (draft.quality_notes?.length) append(left, append(el('div', 'notice input-notice'), el('p', '', draft.quality_notes.join(' '))));
+    if (draft.quality_notes?.length) {
+      const reviewNotes = el('details', 'workspace-evidence'); reviewNotes.setAttribute('id', 'editorial-review-notes');
+      append(reviewNotes, el('summary', '', `작성·검토 메모 (${draft.quality_notes.length})`), ...draft.quality_notes.map(note => el('p', 'evidence-notice', note)));
+      append(left, reviewNotes);
+    }
     append(grid, left, append(el('aside', 'workspace-controls'), senderPanel(), exportPanel(), append(el('div', 'local-note'), el('strong', '', '계정별 로컬 작업'), el('p', '', '자료는 이 컴퓨터에 저장됩니다. AI 구성 시 선택한 근거·회사 입력·수정 지시는 외부 AI로 전송됩니다. 환자 기록을 입력하지 마세요.'))));
     append(page, grid); return page;
   }
@@ -1069,7 +1237,8 @@
     const account = document.getElementById('account-controls');
     if (account) account.replaceChildren(...(signedIn ? [el('span', 'account-email', state.session.user.email), button('로그아웃', 'text-button', logout)] : []));
     main.setAttribute('aria-busy', String(state.busy));
-    main.replaceChildren(!state.sessionLoaded ? append(el('div', 'page'), messages(), !state.busy ? button('연결 다시 확인', 'button primary', bootstrap) : null) : !signedIn ? authPage() : workspace ? workspacePage() : researchResult ? researchResultPage() : state.page === 'saved' ? savedPage() : state.page === 'compose' ? composePage() : topicsPage());
+    const content = !state.sessionLoaded ? append(el('div', 'page'), messages(), !state.busy ? button('연결 다시 확인', 'button primary', bootstrap) : null) : !signedIn ? authPage() : workspace ? workspacePage() : researchResult ? researchResultPage() : state.page === 'saved' ? savedPage() : state.page === 'compose' ? composePage() : topicsPage();
+    main.replaceChildren(...[signedIn && state.traceView ? tracePanel() : null, content].filter(Boolean));
     if (workspace) refreshControls();
     for (const id of openDetails) { const details = document.getElementById(id); if (details) details.open = true; }
     if (focusId) { const restored = document.getElementById(focusId); restored?.focus(); if (selection && restored?.setSelectionRange) restored.setSelectionRange(...selection); }

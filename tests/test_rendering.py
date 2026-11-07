@@ -96,6 +96,26 @@ class RenderingTests(unittest.TestCase):
         title = styles.find("w:style[@w:styleId='Title']", ns)
         self.assertIsNone(title.find(".//w:pBdr", ns))
 
+    def test_news_can_omit_example_and_limitations_without_empty_headings(self):
+        self.draft['brochure']['example'] = {'heading': '', 'body': ''}
+        self.draft['brochure']['limitations'] = []
+        with ZipFile(self.render()) as archive:
+            root = ET.fromstring(archive.read('word/document.xml'))
+        text = ''.join(root.itertext())
+        self.assertNotIn('제안 예시', text)
+        self.assertNotIn('검토 시 유의사항', text)
+        self.assertIn(self.draft['brochure']['sections'][0]['body'], text)
+        self.assertIn('참고 자료', text)
+        self.assertGreater(text.index(self.draft['evidence_notice']),
+                           text.index(self.draft['brochure']['sections'][0]['body']))
+
+    def test_half_empty_example_is_not_exported_as_a_broken_section(self):
+        for example in ({'heading': '예시', 'body': ''}, {'heading': '', 'body': '내용'}):
+            with self.subTest(example=example):
+                self.draft['brochure']['example'] = example
+                with self.assertRaises(ValueError):
+                    self.render()
+
     def test_suggestion_limitations_evidence_and_only_supplied_sender_are_visible(self):
         with ZipFile(self.render()) as archive:
             xml = archive.read("word/document.xml").decode()
